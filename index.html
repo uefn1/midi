@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>軽量MIDIプレイヤー</title>
+<title>MIDI Player</title>
 <style>
   body { font-family: system-ui, sans-serif; padding: 20px; text-align: center; }
   button { font-size: 18px; padding: 12px 24px; margin: 8px; }
@@ -12,7 +12,7 @@
 </style>
 </head>
 <body>
-<h2>大容量MIDI 軽量ストリーミング再生</h2>
+<h2>大容量MIDI プレイヤー</h2>
 <input type="file" id="fileInput" accept=".mid,.midi,audio/midi,audio/x-midi">
 <br>
 <button id="playBtn" disabled>▶ 再生</button>
@@ -23,30 +23,52 @@
 (function () {
   'use strict';
 
-  // ============ ストリーミングMIDIパーサー ============
-  class MIDIStream {
+  const fileInput = document.getElementById('fileInput');
+  const playBtn   = document.getElementById('playBtn');
+  const stopBtn   = document.getElementById('stopBtn');
+  const statusEl  = document.getElementById('status');
+
+  const LOOKAHEAD      = 1.5;    // 秒
+  const SCHED_INTERVAL = 50;     // ms
+  const MAX_VOICES     = 48;
+  const MAX_BUFFER     = 1024 * 1024;
+
+  let audioCtx, masterGain;
+  let isPlaying = false, schedTimer = null, playStart = 0;
+  let pending = [], openNotes = new Map();
+  let evTimes, evTypes, evNotes, evVels, evChs, evCount, evCursor;
+  let currentReader = null;
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // ================= ストリーミングMIDIパーサー =================
+  // 1イベント = {type:'note'|'tempo', on?, tick, note?, vel?, ch?, us?, track?}
+  // trackTick はトラックごとに 0 リセットされる
+  class MIDIParser {
     constructor() {
       this.buf = new Uint8Array(0);
       this.bufPos = 0;
-      this.skipRemaining = 0;
+      this.skip = 0;
       this.eof = false;
-      this.parseDone = false;
+      this.done = false;
       this.phase = 'mthd';
       this.division = 480;
-      this.tempo = 500000;
-      this.time = 0;
-      this.runningStatus = 0;
-      this.trackRemaining = 0;
+      this.format = 0;
+      this.numTracks = 0;
+      this.trackNum = 0;
+      this.trackTick = 0;
+      this.running = 0;
     }
     buffered() { return this.buf.length - this.bufPos; }
+    setEof() { this.eof = true; }
 
     feed(chunk) {
-      if (this.parseDone) return;
-      if (this.skipRemaining > 0) {
-        const skip = Math.min(this.skipRemaining, chunk.length);
-        this.skipRemaining -= skip;
-        if (skip >= chunk.length) return;
-        chunk = chunk.subarray(skip);
+      if (this.done) return;
+      if (this.skip > 0) {
+        const s = Math.min(this.skip, chunk.length);
+        this.skip -= s;
+        if (s >= chunk.length) return;
+        chunk = chunk.subarray(s);
       }
       if (this.bufPos > 0) {
         this.buf = this.buf.slice(this.bufPos);
@@ -58,44 +80,51 @@
       this.buf = merged;
     }
 
-    setEof() { this.eof = true; }
+    _needMore() {
+      if (this.eof) this.done = true;
+      return null;
+    }
 
-    nextEvent() {
-      while (!this.parseDone) {
-        if (this.skipRemaining > 0) {
+    next() {
+      while (!this.done) {
+        if (this.skip > 0) {
           const avail = this.buffered();
           if (avail === 0) return this._needMore();
-          const skip = Math.min(this.skipRemaining, avail);
-          this.bufPos += skip;
-          this.skipRemaining -= skip;
+          const s = Math.min(this.skip, avail);
+          this.bufPos += s;
+          this.skip -= s;
           continue;
         }
         if (this.phase === 'mthd') {
           if (this.buffered() < 14) return this._needMore();
-          const p = this.bufPos;
-          if (this.buf[p] !== 0x4D || this.buf[p+1] !== 0x54 ||
-              this.buf[p+2] !== 0x68 || this.buf[p+3] !== 0x64) {
-            this.parseDone = true; return null;
+          const p = this.bufPos, b = this.buf;
+          if (b[p] !== 0x4D || b[p+1] !== 0x54 || b[p+2] !== 0x68 || b[p+3] !== 0x64) {
+            this.done = true; return null;
           }
-          this.division = (this.buf[p+12] << 8) | this.buf[p+13];
+          this.format    = (b[p+8]  << 8) | b[p+9];
+          this.numTracks = (b[p+10] << 8) | b[p+11];
+          this.division  = (b[p+12] << 8) | b[p+13];
           this.bufPos += 14;
           this.phase = 'mtrk';
           continue;
         }
         if (this.phase === 'mtrk') {
           if (this.buffered() < 8) return this._needMore();
-          const p = this.bufPos;
-          const chunkLen = ((this.buf[p+4]<<24)|(this.buf[p+5]<<16)|(this.buf[p+6]<<8)|this.buf[p+7]) >>> 0;
-          const isTrack = this.buf[p] === 0x4D && this.buf[p+1] === 0x54 &&
-                          this.buf[p+2] === 0x72 && this.buf[p+3] === 0x6B;
+          const p = this.bufPos, b = this.buf;
+          if (b[p] !== 0x4D || b[p+1] !== 0x54 || b[p+2] !== 0x72 || b[p+3] !== 0x6B) {
+            this.bufPos++; continue;   // 次 の MTrk を探す
+          }
+          // ヘッダ8バイトを読み飛ばす。トラック開始時:
           this.bufPos += 8;
-          if (isTrack) { this.trackRemaining = chunkLen; this.phase = 'event'; }
-          else         { this.skipRemaining = chunkLen; }
+          this.trackTick = 0;          // ★ 重要: トラックごとに tick をリセット
+          this.running = 0;
+          this.trackNum++;
+          this.phase = 'event';
           continue;
         }
         if (this.phase === 'event') {
-          if (this.trackRemaining <= 0) { this.phase = 'mtrk'; continue; }
-          if (this.buffered() < 16) return this._needMore();
+          if (this.buffered() < 16 && !this.eof) return this._needMore();
+          if (this.buffered() === 0) return this._needMore();
           const ev = this._parseEvent();
           if (ev) return ev;
           continue;
@@ -104,143 +133,221 @@
       return null;
     }
 
-    _needMore() {
-      if (this.eof) this.parseDone = true;
-      return null;
-    }
-
     _parseEvent() {
-      const buf = this.buf;
-      const startPos = this.bufPos;
-      let p = startPos;
+      const b = this.buf;
+      let p = this.bufPos;
+      const bufEnd = b.length;
 
       let delta = 0;
       for (let i = 0; i < 4; i++) {
-        const b = buf[p++];
-        delta = (delta << 7) | (b & 0x7F);
-        if ((b & 0x80) === 0) break;
+        if (p >= bufEnd) return null;
+        const byte = b[p++];
+        delta = (delta << 7) | (byte & 0x7F);
+        if ((byte & 0x80) === 0) break;
       }
-      this.time += delta * this.tempo / this.division / 1e6;
+      this.trackTick += delta;
 
-      let status = buf[p];
+      if (p >= bufEnd) return null;
+      let status = b[p];
       if (status < 0x80) {
-        status = this.runningStatus;
+        status = this.running;
       } else {
         p++;
-        if (status < 0xF0) this.runningStatus = status;
+        if (status < 0xF0) this.running = status;
       }
 
-      let event = null;
+      let ev = null;
+      let endOfTrack = false;
 
       if (status >= 0x80 && status < 0xF0) {
         const type = status & 0xF0;
         const ch   = status & 0x0F;
         if (type === 0x90 || type === 0x80) {
-          const note = buf[p++];
-          const vel  = buf[p++];
-          if (type === 0x90 && vel > 0) {
-            event = { type:'on',  note, vel: vel/127, ch, time: this.time };
-          } else {
-            event = { type:'off', note, ch, time: this.time };
-          }
-        } else if (type === 0xC0 || type === 0xD0) { p += 1; }
-        else                                       { p += 2; }
-      } else if (status === 0xFF) {
-        const metaType = buf[p++];
-        let mlen = 0;
-        for (let i = 0; i < 4; i++) {
-          const b = buf[p++];
-          mlen = (mlen << 7) | (b & 0x7F);
-          if ((b & 0x80) === 0) break;
-        }
-        if (metaType === 0x51 && mlen === 3) {
-          this.tempo = (buf[p]<<16)|(buf[p+1]<<8)|buf[p+2];
-        }
-        if (metaType === 0x2F) {
-          this.trackRemaining = 0;
-          p += mlen;
+          const note = b[p++];
+          const vel  = b[p++];
+          const on   = type === 0x90 && vel > 0;
+          ev = { type: 'note', on, tick: this.trackTick, note, vel, ch };
+        } else if (type === 0xC0 || type === 0xD0) {
+          p += 1;
         } else {
-          const avail = buf.length - p;
-          if (avail < mlen) { this.skipRemaining = mlen - avail; p = buf.length; }
-          else              { p += mlen; }
+          p += 2;
+        }
+      } else if (status === 0xFF) {
+        const mt = b[p++];
+        let len = 0;
+        for (let i = 0; i < 4; i++) {
+          if (p >= bufEnd) return null;
+          const byte = b[p++];
+          len = (len << 7) | (byte & 0x7F);
+          if ((byte & 0x80) === 0) break;
+        }
+        if (mt === 0x51 && len === 3) {
+          const us = (b[p] << 16) | (b[p+1] << 8) | b[p+2];
+          ev = { type: 'tempo', tick: this.trackTick, us, track: this.trackNum - 1 };
+          p += 3;
+        } else if (mt === 0x2F) {
+          p += len;
+          endOfTrack = true;
+        } else {
+          const avail = bufEnd - p;
+          if (avail < len) {
+            this.bufPos = bufEnd;
+            this.skip = len - avail;
+            return null;
+          }
+          p += len;
         }
       } else if (status === 0xF0 || status === 0xF7) {
-        let mlen = 0;
+        let len = 0;
         for (let i = 0; i < 4; i++) {
-          const b = buf[p++];
-          mlen = (mlen << 7) | (b & 0x7F);
-          if ((b & 0x80) === 0) break;
+          if (p >= bufEnd) return null;
+          const byte = b[p++];
+          len = (len << 7) | (byte & 0x7F);
+          if ((byte & 0x80) === 0) break;
         }
-        const avail = buf.length - p;
-        if (avail < mlen) { this.skipRemaining = mlen - avail; p = buf.length; }
-        else              { p += mlen; }
+        const avail = bufEnd - p;
+        if (avail < len) {
+          this.bufPos = bufEnd;
+          this.skip = len - avail;
+          return null;
+        }
+        p += len;
       } else {
-        this.trackRemaining = 0; p = buf.length;
+        endOfTrack = true;
+        p = bufEnd;
       }
 
-      const consumed = p - startPos;
       this.bufPos = p;
-      if (this.trackRemaining > 0) {
-        this.trackRemaining = Math.max(0, this.trackRemaining - consumed);
-      }
-      return event;
+      if (endOfTrack) this.phase = 'mtrk';
+      return ev;
     }
   }
 
-  // ============ 再生 ============
-  const fileInput = document.getElementById('fileInput');
-  const playBtn   = document.getElementById('playBtn');
-  const stopBtn   = document.getElementById('stopBtn');
-  const statusEl  = document.getElementById('status');
+  // ================= 解析オーケストレーション =================
+  async function streamParse(file, onEvent, onProgress) {
+    const parser = new MIDIParser();
+    currentReader = file.stream().getReader();
+    let bytesRead = 0;
+    const total = file.size;
 
-  const LOOKAHEAD        = 1.0;             // 先読み量：1秒
-  const MAX_VOICES       = 16;              // 同時発音数上限
-  const SCHED_INTERVAL   = 100;             // ms
-  const MAX_BUFFER_BYTES = 1024 * 1024;     // ★ パーサー未解析バッファ上限：1MB
-
-  let audioCtx, masterGain, parser, reader;
-  let isPlaying = false, pending = [], openNotes = new Map();
-  let schedTimer = null, playStart = 0;
-
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-  async function feedLoop(stream, localParser) {
-    reader = stream.getReader();
-    try {
-      while (true) {
-        while (localParser.buffered() > MAX_BUFFER_BYTES && !localParser.parseDone) {
-          await sleep(30);
+    (async () => {
+      try {
+        while (true) {
+          if (parser.buffered() > MAX_BUFFER) { await sleep(10); continue; }
+          const { done, value } = await currentReader.read();
+          if (done) { parser.setEof(); return; }
+          parser.feed(value);
+          bytesRead += value.length;
+          if (onProgress) onProgress(bytesRead / total);
         }
-        if (localParser.parseDone) return;
-        const { done, value } = await reader.read();
-        if (!parser) return;
-        if (done) { localParser.setEof(); return; }
-        localParser.feed(value);
+      } catch (e) {
+        if (e.name !== 'AbortError') console.error(e);
+        parser.setEof();
       }
-    } catch (e) {
-      if (e && e.name !== 'AbortError') console.error(e);
+    })();
+
+    while (!parser.done) {
+      const ev = parser.next();
+      if (ev) onEvent(ev);
+      else await sleep(4);
     }
+    try { currentReader.cancel(); } catch (e) {}
+    currentReader = null;
   }
 
+  async function parseFile(file, onProgress) {
+    // ヘッダからフォーマット取得
+    const headBuf = await file.slice(0, 14).arrayBuffer();
+    const head = new Uint8Array(headBuf);
+    if (head[0] !== 0x4D || head[1] !== 0x54 || head[2] !== 0x68 || head[3] !== 0x64)
+      throw new Error('MIDIファイルではありません');
+    const format   = (head[8]  << 8) | head[9];
+    const division = (head[12] << 8) | head[13];
+
+    // --- Pass 1: テンポマップ構築 ---
+    // テンポは全トラックから集め、tick 昇順に並べる (通常 track 0)
+    const tempoMap = [{ tick: 0, us: 500000 }];
+    await streamParse(file, (ev) => {
+      if (ev.type === 'tempo') tempoMap.push({ tick: ev.tick, us: ev.us });
+    }, p => onProgress && onProgress(p * 0.4));
+    tempoMap.sort((a, b) => a.tick - b.tick);
+
+    // tick → 秒 の累積テーブル
+    const cumSec = [0];
+    for (let i = 1; i < tempoMap.length; i++) {
+      const dt = tempoMap[i].tick - tempoMap[i-1].tick;
+      cumSec[i] = cumSec[i-1] + dt * tempoMap[i-1].us / division / 1e6;
+    }
+    function tickToSec(tick) {
+      let lo = 0, hi = tempoMap.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (tempoMap[mid].tick <= tick) lo = mid;
+        else hi = mid - 1;
+      }
+      return cumSec[lo] + (tick - tempoMap[lo].tick) * tempoMap[lo].us / division / 1e6;
+    }
+
+    // --- Pass 2: ノートイベント収集 (tick → 秒変換) ---
+    const tmpT = [], tmpType = [], tmpNote = [], tmpVel = [], tmpCh = [];
+    await streamParse(file, (ev) => {
+      if (ev.type !== 'note') return;
+      tmpT.push(tickToSec(ev.tick));
+      tmpType.push(ev.on ? 1 : 0);
+      tmpNote.push(ev.note);
+      tmpVel.push(ev.vel);
+      tmpCh.push(ev.ch);
+    }, p => onProgress && onProgress(0.4 + p * 0.5));
+
+    // --- 時刻順ソートして型付き配列へ ---
+    const order = new Array(tmpT.length);
+    for (let i = 0; i < order.length; i++) order[i] = i;
+    order.sort((a, b) => tmpT[a] - tmpT[b]);
+
+    const N = order.length;
+    const times = new Float64Array(N);
+    const types = new Uint8Array(N);
+    const notes = new Uint8Array(N);
+    const vels  = new Uint8Array(N);
+    const chs   = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      const j = order[i];
+      times[i] = tmpT[j]; types[i] = tmpType[j];
+      notes[i] = tmpNote[j]; vels[i] = tmpVel[j]; chs[i] = tmpCh[j];
+    }
+    return { times, types, notes, vels, chs, count: N, format };
+  }
+
+  // ================= 再生 =================
   function schedule() {
     if (!isPlaying) return;
-    const now    = audioCtx.currentTime;
+    const now = audioCtx.currentTime;
     const nowRel = now - playStart;
+    const horizon = nowRel + LOOKAHEAD * 2;
 
-    while (true) {
-      const ev = parser.nextEvent();
-      if (!ev) break;
-      pending.push(ev);
+    // タイムラインから pending へ、horizon 手前まで補充
+    while (evCursor < evCount) {
+      const t = evTimes[evCursor];
+      if (t > horizon) break;
+      pending.push({
+        type: evTypes[evCursor] ? 'on' : 'off',
+        note: evNotes[evCursor],
+        vel:  evVels[evCursor] / 127,
+        ch:   evChs[evCursor],
+        time: t,
+      });
+      evCursor++;
     }
 
+    // スケジュール確定分をオーディオエンジンへ
     while (pending.length && pending[0].time <= nowRel + LOOKAHEAD) {
       const ev = pending.shift();
       const when = Math.max(playStart + ev.time, now);
       if (ev.type === 'on') startNote(ev, when);
-      else                   stopNote(ev, when);
+      else                  stopNote(ev, when);
     }
 
-    if (parser.parseDone && pending.length === 0) {
+    if (evCursor >= evCount && pending.length === 0) {
       statusEl.textContent = '再生完了';
       setTimeout(() => { if (isPlaying) stopPlayback(); }, 1500);
       return;
@@ -251,19 +358,17 @@
   function startNote(ev, when) {
     const key = ev.ch * 128 + ev.note;
     if (openNotes.has(key)) stopNoteKey(key, when);
-
     if (openNotes.size >= MAX_VOICES) {
       const oldKey = openNotes.keys().next().value;
       stopNoteKey(oldKey, when);
     }
-
     const osc  = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
     osc.type = 'triangle';
     osc.frequency.value = 440 * Math.pow(2, (ev.note - 69) / 12);
-    const peak = 0.12 * ev.vel;
+    const peak = 0.06 * ev.vel;
     gain.gain.setValueAtTime(0, when);
-    gain.gain.linearRampToValueAtTime(peak, when + 0.005);
+    gain.gain.linearRampToValueAtTime(peak, when + 0.01);
     osc.connect(gain).connect(masterGain);
     osc.start(when);
     openNotes.set(key, { osc, gain });
@@ -277,8 +382,8 @@
     const t = Math.max(when, audioCtx.currentTime + 0.01);
     try {
       n.gain.gain.cancelScheduledValues(t);
-      n.gain.gain.setTargetAtTime(0, t, 0.03);
-      n.osc.stop(t + 0.15);
+      n.gain.gain.setTargetAtTime(0, t, 0.04);
+      n.osc.stop(t + 0.2);
     } catch (e) {}
     openNotes.delete(key);
   }
@@ -286,32 +391,59 @@
   async function play(file) {
     stopPlayback();
     playBtn.disabled = true;
-    statusEl.textContent = '読み込み中…';
+    stopBtn.disabled = true;
+    statusEl.textContent = '解析中...';
 
-    parser   = new MIDIStream();
+    let batch;
+    try {
+      batch = await parseFile(file, p => {
+        statusEl.textContent = `解析中... ${(p * 100).toFixed(0)}%`;
+      });
+    } catch (e) {
+      console.error(e);
+      statusEl.textContent = '解析エラー: ' + e.message;
+      playBtn.disabled = false;
+      return;
+    }
+
+    evTimes = batch.times; evTypes = batch.types;
+    evNotes = batch.notes; evVels = batch.vels; evChs = batch.chs;
+    evCount = batch.count; evCursor = 0;
+    pending = []; openNotes = new Map();
+
+    if (evCount === 0) {
+      statusEl.textContent = 'ノートイベントがありません';
+      playBtn.disabled = false;
+      return;
+    }
+
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === 'suspended') await audioCtx.resume();
 
     masterGain = audioCtx.createGain();
     masterGain.gain.value = 0.7;
-    masterGain.connect(audioCtx.destination);
 
-    playStart = audioCtx.currentTime + 0.1;
+    const comp = audioCtx.createDynamicsCompressor();
+    comp.threshold.value = -10;
+    comp.knee.value = 10;
+    comp.ratio.value = 6;
+    comp.attack.value = 0.005;
+    comp.release.value = 0.1;
+
+    masterGain.connect(comp);
+    comp.connect(audioCtx.destination);
+
+    playStart = audioCtx.currentTime + 0.2;
     isPlaying = true;
-    pending = [];
-    openNotes = new Map();
-
-    feedLoop(file.stream(), parser);
-
     stopBtn.disabled = false;
-    statusEl.textContent = '再生中…';
+    statusEl.textContent = `再生中... (${batch.format === 1 ? 'Format 1' : 'Format 0'}, ${evCount}イベント)`;
     schedule();
   }
 
   function stopPlayback() {
     isPlaying = false;
     clearTimeout(schedTimer);
-    if (reader) { try { reader.cancel(); } catch (e) {} reader = null; }
+    if (currentReader) { try { currentReader.cancel(); } catch (e) {} currentReader = null; }
     if (audioCtx) {
       const t = audioCtx.currentTime;
       for (const { osc, gain } of openNotes.values()) {
@@ -319,14 +451,16 @@
         try { osc.stop(); } catch (e) {}
       }
     }
-    openNotes.clear(); pending = []; parser = null;
+    openNotes.clear(); pending = [];
+    evTimes = evTypes = evNotes = evVels = evChs = null;
+    evCount = 0; evCursor = 0;
     if (masterGain) { try { masterGain.disconnect(); } catch (e) {} masterGain = null; }
     if (audioCtx)   { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
     playBtn.disabled = !(fileInput.files && fileInput.files[0]);
     stopBtn.disabled = true;
   }
 
-  // ============ UI ============
+  // ================= UI =================
   fileInput.addEventListener('change', () => {
     const file = fileInput.files && fileInput.files[0];
     if (!file) { playBtn.disabled = true; statusEl.textContent = 'ファイルを選択してください'; return; }
@@ -338,11 +472,7 @@
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
     try { await play(file); }
-    catch (e) {
-      console.error(e);
-      statusEl.textContent = '再生エラー: ' + e.message;
-      stopPlayback();
-    }
+    catch (e) { console.error(e); statusEl.textContent = '再生エラー: ' + e.message; stopPlayback(); }
   });
 
   stopBtn.addEventListener('click', stopPlayback);
