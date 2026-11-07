@@ -193,10 +193,10 @@
   const stopBtn   = document.getElementById('stopBtn');
   const statusEl  = document.getElementById('status');
 
-  const LOOKAHEAD        = 1.0;   // ★ 先読み量：1秒
-  const MAX_VOICES       = 16;    // 同時発音数上限
-  const SCHED_INTERVAL   = 100;   // ms
-  const MAX_BUFFER_BYTES = 32 * 1024;
+  const LOOKAHEAD        = 1.0;             // 先読み量：1秒
+  const MAX_VOICES       = 16;              // 同時発音数上限
+  const SCHED_INTERVAL   = 100;             // ms
+  const MAX_BUFFER_BYTES = 1024 * 1024;     // ★ パーサー未解析バッファ上限：1MB
 
   let audioCtx, masterGain, parser, reader;
   let isPlaying = false, pending = [], openNotes = new Map();
@@ -227,14 +227,12 @@
     const now    = audioCtx.currentTime;
     const nowRel = now - playStart;
 
-    // ★ 上限なしで、パーサーが返す限り取得
     while (true) {
       const ev = parser.nextEvent();
       if (!ev) break;
       pending.push(ev);
     }
 
-    // 先読み範囲内をオーディオスケジューラへ
     while (pending.length && pending[0].time <= nowRel + LOOKAHEAD) {
       const ev = pending.shift();
       const when = Math.max(playStart + ev.time, now);
