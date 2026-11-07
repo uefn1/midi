@@ -24,16 +24,14 @@
   'use strict';
 
   // ============ ストリーミングMIDIパーサー ============
-  // チャンクを feed() で投入 → nextEvent() で1件ずつ取り出す。
-  // 未解析バッファは小さいまま（最大32KBはfeedLoop側で制御）。
   class MIDIStream {
     constructor() {
       this.buf = new Uint8Array(0);
       this.bufPos = 0;
-      this.skipRemaining = 0;   // メタ/シーケンスの読み飛ばし残り
+      this.skipRemaining = 0;
       this.eof = false;
       this.parseDone = false;
-      this.phase = 'mthd';       // mthd → mtrk → event
+      this.phase = 'mthd';
       this.division = 480;
       this.tempo = 500000;
       this.time = 0;
@@ -44,14 +42,12 @@
 
     feed(chunk) {
       if (this.parseDone) return;
-      // 読み飛ばし中はバッファに積まない
       if (this.skipRemaining > 0) {
         const skip = Math.min(this.skipRemaining, chunk.length);
         this.skipRemaining -= skip;
         if (skip >= chunk.length) return;
         chunk = chunk.subarray(skip);
       }
-      // 先頭の消費済みバイトを捨てて結合
       if (this.bufPos > 0) {
         this.buf = this.buf.slice(this.bufPos);
         this.bufPos = 0;
@@ -118,7 +114,6 @@
       const startPos = this.bufPos;
       let p = startPos;
 
-      // デルタタイム（可変長）
       let delta = 0;
       for (let i = 0; i < 4; i++) {
         const b = buf[p++];
@@ -127,10 +122,9 @@
       }
       this.time += delta * this.tempo / this.division / 1e6;
 
-      // ステータス or ランニングステータス
       let status = buf[p];
       if (status < 0x80) {
-        status = this.runningStatus;   // pは据え置き（データバイト）
+        status = this.runningStatus;
       } else {
         p++;
         if (status < 0xF0) this.runningStatus = status;
@@ -162,7 +156,7 @@
         if (metaType === 0x51 && mlen === 3) {
           this.tempo = (buf[p]<<16)|(buf[p+1]<<8)|buf[p+2];
         }
-        if (metaType === 0x2F) {           // End of Track
+        if (metaType === 0x2F) {
           this.trackRemaining = 0;
           p += mlen;
         } else {
@@ -199,11 +193,10 @@
   const stopBtn   = document.getElementById('stopBtn');
   const statusEl  = document.getElementById('status');
 
-  const LOOKAHEAD        = 0.5;   // 秒
-  const MAX_PENDING      = 50;    // 未スケジュールイベント上限
+  const LOOKAHEAD        = 1.0;   // ★ 先読み量：1秒
   const MAX_VOICES       = 16;    // 同時発音数上限
   const SCHED_INTERVAL   = 100;   // ms
-  const MAX_BUFFER_BYTES = 32 * 1024; // パーサー未解析バッファ上限
+  const MAX_BUFFER_BYTES = 32 * 1024;
 
   let audioCtx, masterGain, parser, reader;
   let isPlaying = false, pending = [], openNotes = new Map();
@@ -215,7 +208,6 @@
     reader = stream.getReader();
     try {
       while (true) {
-        // バックプレッシャ: バッファが大きければ待つ
         while (localParser.buffered() > MAX_BUFFER_BYTES && !localParser.parseDone) {
           await sleep(30);
         }
@@ -235,14 +227,14 @@
     const now    = audioCtx.currentTime;
     const nowRel = now - playStart;
 
-    // バッファ補充（上限まで）
-    while (pending.length < MAX_PENDING) {
+    // ★ 上限なしで、パーサーが返す限り取得
+    while (true) {
       const ev = parser.nextEvent();
       if (!ev) break;
       pending.push(ev);
     }
 
-    // 先読み範囲内のイベントをオーディオスケジューラへ
+    // 先読み範囲内をオーディオスケジューラへ
     while (pending.length && pending[0].time <= nowRel + LOOKAHEAD) {
       const ev = pending.shift();
       const when = Math.max(playStart + ev.time, now);
@@ -262,7 +254,6 @@
     const key = ev.ch * 128 + ev.note;
     if (openNotes.has(key)) stopNoteKey(key, when);
 
-    // ポリフォニー上限：Map挿入順の先頭＝最古の音を落とす
     if (openNotes.size >= MAX_VOICES) {
       const oldKey = openNotes.keys().next().value;
       stopNoteKey(oldKey, when);
@@ -312,7 +303,7 @@
     pending = [];
     openNotes = new Map();
 
-    feedLoop(file.stream(), parser);   // バックグラウンドで供給
+    feedLoop(file.stream(), parser);
 
     stopBtn.disabled = false;
     statusEl.textContent = '再生中…';
